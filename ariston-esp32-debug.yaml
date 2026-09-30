@@ -1,0 +1,97 @@
+# Optional decoding tools for ariston-esp32.yaml. Enable them by uncommenting the `packages:`
+# lines at the top of ariston-esp32.yaml.
+
+text:
+  # Send any frame to the heater: type the command + data in hex, e.g. `25 79 2D` (read register
+  # 79 2D) or `33 79 2D B2 02` (write 69.0 to 79 2D). The ESP adds the C3 41 header, the length
+  # and the checksum. The response shows up in the log (<<<).
+  # WARNING: writes (0x33) are allowed.
+  - platform: template
+    id: send_frame
+    name: "Send frame (hex)"
+    mode: text
+    optimistic: true
+    max_length: 80
+    set_action:
+      - lambda: |-
+          std::vector<int> d;
+          std::string h;
+          for (char c : x) {
+            if (c == ' ') continue;
+            if (!isxdigit((unsigned char) c)) { ESP_LOGW("frame", "invalid character: '%c'", c); return; }
+            h += c;
+          }
+          if (h.empty() || h.size() % 2) { ESP_LOGW("frame", "odd number of hex digits"); return; }
+          for (size_t i = 0; i < h.size(); i += 2) d.push_back(strtol(h.substr(i, 2).c_str(), nullptr, 16));
+          id(send_frame_script).execute(d);
+
+  # Register scan. Enter the range as the numeric register value (high byte first):
+  # `2100-21FF` = all `xx 21` registers, read with 0x23 (6 per request, only non-zero responses
+  # are logged). With the `25 ` prefix (e.g. `25 2100-21FF`) every register is read on its own
+  # with 0x25 and every response (value + limits) is logged. `stop` stops the scan.
+  # Log tag `scan`. Read-only.
+  # WARNING: reading register 0000 (one of 0000-0005, most likely 0000) resets the heater's MCU.
+  # Start scans at 0010.
+  - platform: template
+    id: register_scan
+    name: "Register scan"
+    mode: text
+    optimistic: true
+    max_length: 20
+    set_action:
+      - lambda: |-
+          if (x == "stop") { id(scan_active) = false; ESP_LOGI("scan", "stopped at %04X", id(scan_cur)); return; }
+          unsigned a, b;
+          int cmd = 0x23;
+          const char *r = x.c_str();
+          if (x.rfind("25 ", 0) == 0) { cmd = 0x25; r += 3; }
+          if (sscanf(r, "%x-%x", &a, &b) != 2 || a > b || b > 0xFFFF) {
+            ESP_LOGW("scan", "format: 2100-21FF, 25 2100-21FF or stop");
+            return;
+          }
+          id(scan_cmd) = cmd;
+          id(scan_cur) = a;
+          id(scan_end) = b;
+          id(scan_active) = true;
+          ESP_LOGI("scan", "started %04X-%04X (0x%02X)", a, b, cmd);
+          id(scan_script).execute();
+
+script:
+  - id: scan_script
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(scan_active) && id(scan_cur) <= id(scan_end);'
+          then:
+            - lambda: |-
+                if (id(scan_cmd) == 0x25) {
+                  int r = id(scan_cur);
+                  id(send_frame_script).execute({0x25, r & 0xFF, (r >> 8) & 0xFF});
+                  id(scan_cur) += 1;
+                } else {
+                  std::vector<int> c = {0x23};
+                  for (int k = 0; k < 6; k++) {
+                    int r = id(scan_cur) + k;
+                    if (r > 0xFFFF) r = 0xFFFF;
+                    c.push_back(r & 0xFF);
+                    c.push_back((r >> 8) & 0xFF);
+                  }
+                  id(send_frame_script).execute(c);
+                  id(scan_cur) += 6;
+                }
+            - delay: 500ms
+      - lambda: |-
+          if (id(scan_active)) ESP_LOGI("scan", "done, up to %04X", id(scan_end));
+          id(scan_active) = false;
+
+globals:
+  - id: scan_cur
+    type: int
+    initial_value: '0'
+  - id: scan_end
+    type: int
+    initial_value: '0'
+  - id: scan_cmd
+    type: int
+    initial_value: '0x23'

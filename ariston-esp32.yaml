@@ -1,0 +1,404 @@
+# ESPHome config for an Ariston Velis Evo Plus water heater (control board HMI-VEL-TOP EU,
+# MCU NXP MKE02Z64VLH4), talking to the board over the unpopulated connector CN6.
+# See README.md for the wiring, and DEBUG.md for the protocol and the register map.
+#
+# Wiring (level shifter: A side = 3.3 V, B side = 5 V):
+#   XIAO 3V3        -> VCCA
+#   CN6 pin 3 (+5V) -> VCCB
+#   XIAO GND        -> GND   <- CN6 pin 4 (GND)
+#   XIAO D8  GPIO8  <- A / B <- CN6 pin 1 (TX of the heater board)
+#   XIAO D9  GPIO9  -> A / B -> CN6 pin 2 (RX of the heater board)
+#   D6/D7 (GPIO11/12) are avoided: they are UART0, where the ESP32 ROM prints boot messages.
+#
+# POWER: do NOT power the ESP from CN6 pin 3. That 5 V comes from a 78L05 (100 mA max) on the
+# control board and cannot run an ESP32. Use a 12 V -> 5 V converter into the XIAO 5V pin
+# (12 V is available on the control board, see README).
+
+# Decoding tools ("Send frame (hex)" and "Register scan" in Home Assistant): uncomment the two
+# lines below. Most people will not need them.
+# packages:
+#   debug: !include ariston-esp32-debug.yaml
+
+esphome:
+  name: ariston-esp32
+  friendly_name: Ariston
+
+esp32:
+  board: esp32-c5-devkitc-1
+  variant: esp32c5
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+# Keep UART0 free, log over USB
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_key
+  on_client_connected:
+    - script.execute: sync_clock
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+
+# XIAO user LED (GPIO27, active LOW): slow blink = warning (e.g. no Wi-Fi/API), fast blink = error,
+# off = all good.
+status_led:
+  pin:
+    number: GPIO27
+    inverted: true
+
+button:
+  - platform: restart
+    name: "Reboot"
+
+  # Read everything now (same as the periodic read).
+  - platform: template
+    name: "Read now"
+    on_press:
+      - script.execute: read_all
+
+uart:
+  id: uart_heater
+  rx_pin: GPIO8     # D8, from CN6 pin 1 (heater TX)
+  tx_pin: GPIO9     # D9, to CN6 pin 2 (heater RX)
+  baud_rate: 9600
+  debug:
+    direction: BOTH
+    dummy_receiver: true   # without it nothing reads the buffer and nothing gets logged
+    after:
+      timeout: 10ms        # one byte takes ~1 ms at 9600 baud; a 10 ms gap ends the frame
+      bytes: 64
+    sequence:
+      - lambda: |-
+          UARTDebug::log_hex(direction, bytes, ' ');
+          // Responses do not contain the register that was asked for, so remember the command
+          // and the first register of the last request. Debug callbacks arrive in wire order and
+          // all requests go through the `send_frame_script` script (one every 300 ms), so they do not overlap.
+          static uint8_t last_cmd = 0;
+          static uint16_t last_reg = 0;
+          if (direction == uart::UART_DIRECTION_TX) {
+            if (bytes.size() >= 6 && bytes[0] == 0xC3 && bytes[1] == 0x41) {
+              last_cmd = bytes[2];
+              last_reg = bytes[4] | (bytes[5] << 8);
+            }
+            return;
+          }
+          for (size_t i = 0; i + 4 < bytes.size(); i++) {
+            if (bytes[i] != 0xC3 || bytes[i + 1] != 0x14) continue;
+            uint8_t cmd = bytes[i + 2], len = bytes[i + 3];
+            if (i + 5 + len > bytes.size()) return;
+            uint8_t sum = 0;
+            for (size_t k = i; k < i + 4 + len; k++) sum += bytes[k];
+            if (sum != bytes[i + 4 + len]) return;
+            if (cmd != last_cmd) return;
+            const uint8_t *d = &bytes[i + 4];
+            // Register scan: log only responses that are not all zero.
+            if (id(scan_active) && cmd == 0x23) {
+              bool nonzero = false;
+              for (int k = 0; k < len; k++) if (d[k]) nonzero = true;
+              if (nonzero) {
+                std::string h;
+                char o[4];
+                for (int k = 0; k < len; k++) { snprintf(o, sizeof(o), "%02X ", d[k]); h += o; }
+                ESP_LOGI("scan", "%04X..%04X (len %u): %s", last_reg, last_reg + 5, len, h.c_str());
+              }
+            }
+            // Register scan with 0x25 (debug package): log every response (value + limits).
+            if (id(scan_active) && cmd == 0x25) {
+              std::string h;
+              char o[4];
+              for (int k = 0; k < len; k++) { snprintf(o, sizeof(o), "%02X ", d[k]); h += o; }
+              ESP_LOGI("scan", "%04X (0x25): %s", last_reg, h.c_str());
+            }
+            auto t = [&](int o) { return (float) (int16_t) (d[o] | (d[o + 1] << 8)) / 10.0f; };
+            if (cmd == 0x23) {
+              switch (last_reg) {
+                // 60 10 / 68 13 / 69 13 / 6A 13 / 6B 13 / 43 51: average + 4 temperatures (x10).
+                // The first value is exactly the average of the next four.
+                case 0x1060:
+                  if (len != 12) break;
+                  id(temp_average).publish_state(t(0));
+                  id(temp_1).publish_state(t(2));
+                  id(temp_2).publish_state(t(4));
+                  id(temp_3).publish_state(t(6));
+                  id(temp_4).publish_state(t(8));
+                  break;
+                // D3 4B / C4 4B / D9 46 / 5E 47 / CB 4B / CC 4B, 7 bytes.
+                // [0] = anti-legionella cycle running, [1] = heating,
+                // [3] = minutes to reach the set temperature (5 minute steps).
+                case 0x4BD3:
+                  if (len != 7) break;
+                  id(antilegionella_cycle).publish_state(d[0] != 0);
+                  id(heating).publish_state(d[1] != 0);
+                  id(time_to_temp).publish_state(d[3]);
+                  break;
+                // 4B D8 / 5E D9 / 5F D9 / 6E 9E / 71 9E / 44 DC: byte 6 (register 6E 9E) is the
+                // temperature shown on the panel.
+                case 0xD84B:
+                  if (len != 12) break;
+                  id(temp_displayed).publish_state(t(6));
+                  break;
+                // DE 40 / DF 40 / DD 40 / DC 40 / DB 40 / DA 40, one byte each:
+                // [4] = hour, [5] = minute; FF FF = clock not set (after a power cut).
+                case 0x40DE:
+                  if (len != 6) break;
+                  if (d[4] == 0xFF || d[5] == 0xFF) {
+                    id(heater_clock).publish_state("not set");
+                    id(sync_clock).execute();
+                  } else {
+                    char buf[6];
+                    snprintf(buf, sizeof(buf), "%02u:%02u", d[4] % 100, d[5] % 100);
+                    id(heater_clock).publish_state(buf);
+                    // Re-sync when the heater clock is more than 3 minutes off.
+                    auto now = id(ha_time).now();
+                    if (now.is_valid()) {
+                      int diff = abs((d[4] * 60 + d[5]) - (now.hour * 60 + now.minute));
+                      if (diff > 12 * 60) diff = 24 * 60 - diff;   // across midnight
+                      if (diff > 3) id(sync_clock).execute();
+                    }
+                  }
+                  break;
+              }
+            }
+            // 0x25 = one register: 2-byte value, followed by its limits.
+            if (cmd == 0x25 && len >= 2) {
+              uint16_t v = d[0] | (d[1] << 8);
+              switch (last_reg) {
+                case 0x2105: id(heater_power).publish_state(v != 0); break;                  // 05 21
+                case 0x2106: id(heater_eco).publish_state(v != 0); break;                    // 06 21
+                case 0x210A: id(antilegionella).publish_state(v != 0); break;         // 0A 21
+                case 0x2D79: id(set_temperature).publish_state(v / 10.0f); break;     // 79 2D
+                case 0x27DD:                                                          // DD 27
+                  if (v == 1) id(heater_mode).publish_state("MAN");
+                  else if (v == 2) id(heater_mode).publish_state("P1");
+                  else if (v == 3) id(heater_mode).publish_state("P2");
+                  else if (v == 4) id(heater_mode).publish_state("P1+P2");
+                  break;
+              }
+            }
+            return;
+          }
+
+switch:
+  # Each command is a write (0x33) followed by a read-back (0x25); the state comes only from the
+  # read-back. restore_mode DISABLED: the ESP sends nothing at boot (the default ALWAYS_OFF would
+  # switch the heater off every time the ESP restarts).
+  - platform: template
+    id: heater_power
+    name: "Power"
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x05, 0x21, 0x01}); id(send_frame_script).execute({0x25, 0x05, 0x21});'
+    turn_off_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x05, 0x21, 0x00}); id(send_frame_script).execute({0x25, 0x05, 0x21});'
+  - platform: template
+    id: heater_eco
+    name: "ECO"
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x06, 0x21, 0x01}); id(send_frame_script).execute({0x25, 0x06, 0x21});'
+    turn_off_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x06, 0x21, 0x00}); id(send_frame_script).execute({0x25, 0x06, 0x21});'
+  - platform: template
+    id: antilegionella
+    name: "Anti-legionella"
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x0A, 0x21, 0x01}); id(send_frame_script).execute({0x25, 0x0A, 0x21});'
+    turn_off_action:
+      - lambda: 'id(send_frame_script).execute({0x33, 0x0A, 0x21, 0x00}); id(send_frame_script).execute({0x25, 0x0A, 0x21});'
+
+binary_sensor:
+  - platform: template
+    id: antilegionella_cycle
+    name: "Anti-legionella cycle running"
+  - platform: template
+    id: heating
+    name: "Heating"
+
+number:
+  # 79 2D, in tenths of a degree. The heater accepts values outside the panel's range when they
+  # come over the serial port, so keep min/max sane here.
+  - platform: template
+    id: set_temperature
+    name: "Set temperature"
+    min_value: 40
+    max_value: 80
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = lroundf(x * 10);
+          id(send_frame_script).execute({0x33, 0x79, 0x2D, v & 0xFF, (v >> 8) & 0xFF});
+          id(send_frame_script).execute({0x25, 0x79, 0x2D});
+
+select:
+  # DD 27: 1 = MAN, 2 = P1, 3 = P2, 4 = P1+P2 (same order as the MODE button).
+  - platform: template
+    id: heater_mode
+    name: "Mode"
+    options: ["MAN", "P1", "P2", "P1+P2"]
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int n = 1;
+          if (x == "P1") n = 2;
+          else if (x == "P2") n = 3;
+          else if (x == "P1+P2") n = 4;
+          id(send_frame_script).execute({0x33, 0xDD, 0x27, n});
+          id(send_frame_script).execute({0x25, 0xDD, 0x27});
+
+text_sensor:
+  - platform: template
+    id: heater_clock
+    name: "Clock"
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+sensor:
+  # Two probes (one per tank) with two thermistors each; mapped by heating and drawing water.
+  - platform: template
+    id: temp_average
+    name: "Average temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temp_1
+    name: "Right tank bottom"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temp_2
+    name: "Right tank top"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temp_3
+    name: "Left tank bottom"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temp_4
+    name: "Left tank top"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temp_displayed
+    name: "Displayed temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: time_to_temp
+    name: "Time to set temperature"
+    unit_of_measurement: "min"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+script:
+  # The only path to the heater: adds the C3 41 header, the length and the checksum, sends the
+  # frame and waits 300 ms. `queued` = frames go out one by one and never overlap on the wire.
+  - id: send_frame_script
+    mode: queued
+    max_runs: 40
+    parameters:
+      frame: int[]
+    then:
+      - lambda: |-
+          if (frame.empty()) return;
+          std::vector<uint8_t> b = {0xC3, 0x41, (uint8_t) frame[0], (uint8_t) (frame.size() - 1)};
+          for (size_t i = 1; i < frame.size(); i++) b.push_back((uint8_t) frame[i]);
+          uint8_t sum = 0;
+          for (auto v : b) sum += v;
+          b.push_back(sum);
+          id(uart_heater).write_array(b.data(), b.size());
+      - delay: 300ms
+
+  # Full read: init frame (in case the heater restarted), the 0x23 requests and the settings
+  # registers (0x25). Read-only.
+  - id: read_all
+    mode: single
+    then:
+      - lambda: |-
+          static const std::vector<std::vector<int>> requests = {
+            {0x52, 0x02, 0x0B, 0x00},
+            {0x23, 0x60, 0x10, 0x68, 0x13, 0x69, 0x13, 0x6A, 0x13, 0x6B, 0x13, 0x43, 0x51},
+            {0x23, 0xD3, 0x4B, 0xC4, 0x4B, 0xD9, 0x46, 0x5E, 0x47, 0xCB, 0x4B, 0xCC, 0x4B},
+            {0x23, 0x4B, 0xD8, 0x5E, 0xD9, 0x5F, 0xD9, 0x6E, 0x9E, 0x71, 0x9E, 0x44, 0xDC},
+            {0x23, 0xDE, 0x40, 0xDF, 0x40, 0xDD, 0x40, 0xDC, 0x40, 0xDB, 0x40, 0xDA, 0x40},
+            {0x25, 0x05, 0x21},
+            {0x25, 0x06, 0x21},
+            {0x25, 0x0A, 0x21},
+            {0x25, 0xDD, 0x27},
+            {0x25, 0x79, 0x2D},
+          };
+          for (auto &r : requests) id(send_frame_script).execute(r);
+
+  # Writes the Home Assistant time into the heater: after the HA API connects, at least 10 s after
+  # boot, and whenever the periodic read finds the clock not set (FF FF) or more than 3 minutes off.
+  - id: sync_clock
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return millis() > 10000;'
+      - wait_until:
+          condition:
+            lambda: 'return id(ha_time).now().is_valid();'
+          timeout: 60s
+      - if:
+          condition:
+            lambda: 'return id(ha_time).now().is_valid();'
+          then:
+            - lambda: |-
+                auto t = id(ha_time).now();
+                id(send_frame_script).execute({0x33, 0xDB, 0x40, t.hour});
+                id(send_frame_script).execute({0x33, 0xDA, 0x40, t.minute});
+                id(send_frame_script).execute({0x23, 0xDE, 0x40, 0xDF, 0x40, 0xDD, 0x40, 0xDC, 0x40, 0xDB, 0x40, 0xDA, 0x40});
+
+globals:
+  # Set by the register scanner in ariston-esp32-debug.yaml; stays false without it.
+  - id: scan_active
+    type: bool
+    initial_value: 'false'
+
+interval:
+  - interval: 60s
+    then:
+      - script.execute: read_all
